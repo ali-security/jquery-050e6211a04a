@@ -1107,6 +1107,29 @@ test("jQuery.extend(Object, Object)", function() {
 	deepEqual( options2, options2Copy, "Check if not modified: options2 must not be modified" );
 });
 
+test( "jQuery.extend( true, ... ) Object.prototype pollution", function() {
+	expect( 2 );
+
+	var polluted, pollutedNested;
+
+	// JSON.parse is the only way to build an own, enumerable "__proto__"
+	// property; an object literal would set the prototype instead.
+	jQuery.extend( true, {}, JSON.parse( "{\"__proto__\": {\"devMode\": true}}" ) );
+	polluted = "devMode" in {};
+
+	// Clean up right away; a polluted Object.prototype breaks
+	// jQuery.isPlainObject and would cascade into every later test.
+	delete Object.prototype.devMode;
+
+	jQuery.extend( true, {}, JSON.parse( "{\"a\": {\"__proto__\": {\"devMode2\": true}}}" ) );
+	pollutedNested = "devMode2" in {};
+
+	delete Object.prototype.devMode2;
+
+	ok( !polluted, "Object.prototype not polluted" );
+	ok( !pollutedNested, "Object.prototype not polluted through a nested object" );
+});
+
 test("jQuery.each(Object,Function)", function() {
 	expect( 23 );
 
