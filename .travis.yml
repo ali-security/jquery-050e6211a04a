@@ -1,3 +1,67 @@
 language: node_js
 node_js:
 - '0.10'
+script:
+# Upstream's own leg: `npm test` is the default grunt task (jsonlint, build,
+# jshint/jscs, uglify, dist, compare_size).
+- npm test
+# jQuery 1.11's unit suite is the browser QUnit page at test/index.html, which
+# upstream drove through TestSwarm — a service we cannot reach. Serve the repo
+# with PHP (the ajax fixtures under test/data are .php) and drive the page with
+# headless Chrome. The driver needs a modern Node, so it runs under its own nvm
+# install; the suite itself is exercised against the dist/jquery.js that the
+# `npm test` step above just built with Node 0.10.
+- command -v php || (sudo apt-get update -qq && sudo apt-get install -y php-cli)
+- php -S 127.0.0.1:8000 -t . > /tmp/php-server.log 2>&1 &
+- sleep 5
+- curl -sSf -o /dev/null http://127.0.0.1:8000/test/index.html
+- |
+  mkdir -p /tmp/driver
+  cat > /tmp/driver/qunit-runner.js <<'RUNNER'
+  const puppeteer = require( "puppeteer" );
+
+  ( async () => {
+    const browser = await puppeteer.launch( {
+      args: [ "--no-sandbox", "--disable-dev-shm-usage" ]
+    } );
+    const page = await browser.newPage();
+    page.on( "pageerror", err => console.log( "[pageerror]", err.message ) );
+    await page.goto( "http://127.0.0.1:8000/test/index.html",
+      { waitUntil: "domcontentloaded", timeout: 120000 } );
+
+    await page.waitForFunction( () => {
+      const el = document.getElementById( "qunit-testresult" );
+      return el && /assertions of/.test( el.textContent );
+    }, { timeout: 1800000, polling: 2000 } );
+
+    const result = await page.evaluate( () => ( {
+      summary: document.getElementById( "qunit-testresult" ).textContent,
+      failed: Array.prototype.map.call(
+        document.querySelectorAll( "#qunit-tests > li.fail" ),
+        li => {
+          const name = li.querySelector( "strong" );
+          const assertions = Array.prototype.map.call(
+            li.querySelectorAll( "ol > li.fail .test-message" ),
+            m => m.textContent
+          );
+          return ( name ? name.textContent : "?" ) +
+            ( assertions.length ? " || " + assertions.join( " | " ) : "" );
+        }
+      )
+    } ) );
+
+    console.log( "QUnit: " + result.summary );
+    result.failed.forEach( f => console.log( "FAILED TEST: " + f ) );
+    await browser.close();
+    process.exit( result.failed.length ? 1 : 0 );
+  } )();
+  RUNNER
+- |
+  set -e
+  export NVM_DIR="$HOME/.nvm"
+  . "$NVM_DIR/nvm.sh"
+  nvm install 20
+  nvm use 20
+  cd /tmp/driver
+  npm install puppeteer@23
+  node /tmp/driver/qunit-runner.js

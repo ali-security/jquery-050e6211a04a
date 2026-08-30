@@ -2,6 +2,7 @@
 .jshintrc
 
 /.editorconfig
+/.github
 /.gitattributes
 /.jscs.json
 /.mailmap

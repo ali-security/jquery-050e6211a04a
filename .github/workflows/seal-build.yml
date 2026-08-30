@@ -1,0 +1,143 @@
+name: seal-build
+
+# Build-and-pack only: jQuery 1.11.1 predates GitHub Actions and its test suite
+# runs on Travis (.travis.yml), so this workflow just reproduces the published
+# npm tarball.
+#
+# dist/jquery.js is the package `main`, and the checked-in dist/ is the
+# pre-patch release build. It therefore has to be regenerated from src/ here --
+# packing dist/ as it comes out of the checkout would ship code that does not
+# contain the security fix at all.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1.11.1 was published from Node 0.10 / npm 1.x, whose packlist still
+      # ships dotfiles such as .npmignore that later npm majors always drop.
+      # The same Node also runs the build below, so dist/ is produced by the
+      # exact toolchain (requirejs 2.1.10, grunt-contrib-uglify 0.3.2, ...)
+      # that package.json pins.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '0.10'
+
+      - name: Install the build toolchain
+        run: npm install
+
+      # `npm test` is the default grunt task -- jsonlint, build:*:*, jshint/jscs,
+      # uglify, dist:*, compare_size -- i.e. exactly the build Travis performs on
+      # this tree. It regenerates dist/jquery.js, dist/jquery.min.js and
+      # dist/jquery.min.map from the patched src/.
+      - name: Rebuild dist from src
+        run: npm test
+
+      # The point of rebuilding is that the shipped artifact carries the fix, so
+      # fail loudly rather than pack a stale dist/. src/core/support.js feature
+      # detects document.implementation.createHTMLDocument and src/core/parseHTML.js
+      # parses into that inert document, so both strings must survive into the
+      # concatenated and the minified build.
+      - name: Assert dist was rebuilt and carries the patched parseHTML
+        run: |
+          ls -l dist
+          grep -q "support.createHTMLDocument = " dist/jquery.js
+          grep -q "document.implementation.createHTMLDocument" dist/jquery.js
+          grep -q "createHTMLDocument" dist/jquery.min.js
+          grep -q "createHTMLDocument" dist/jquery.min.map
+          # src/ajax/script.js turns off script content-type sniffing for
+          # cross-domain requests, so the assignment has to reach the build too.
+          # The unpatched release only ever names `script` inside the
+          # `contents: { script: ... }` literal, never as `contents.script`.
+          grep -q "s.contents.script = false" dist/jquery.js
+          grep -q "contents.script" dist/jquery.min.js
+          # src/core.js skips an own, enumerable "__proto__" key in the
+          # jQuery.extend deep copy. The unit suite loads dist/jquery.min.js,
+          # so the guard must survive the concat and uglify alike; the string
+          # never appears anywhere in the unpatched release.
+          grep -q 'name === "__proto__"' dist/jquery.js
+          grep -q '__proto__' dist/jquery.min.js
+          echo "dist/jquery.js bytes: $(wc -c < dist/jquery.js)"
+          echo "dist/jquery.min.js bytes: $(wc -c < dist/jquery.min.js)"
+
+      # The published tarball carries dist/cdn/*, which upstream produces in
+      # build/release.js#makeReleaseCopies. That function only runs under the
+      # jquery-release tool (it needs push/publish credentials), so its copy
+      # step is lifted verbatim here.
+      - name: Generate the dist/cdn release copies
+        run: |
+          cat > /tmp/release-copies.js <<'EOF'
+          var fs = require( "fs" ),
+            version = JSON.parse( fs.readFileSync( "package.json", "utf8" ) ).version,
+            devFile = "dist/jquery.js",
+            minFile = "dist/jquery.min.js",
+            mapFile = "dist/jquery.min.map",
+            cdnFolder = "dist/cdn",
+            releaseFiles = {
+              "jquery-VER.js": devFile,
+              "jquery-VER.min.js": minFile,
+              "jquery-VER.min.map": mapFile,
+              "jquery.js": devFile,
+              "jquery.min.js": minFile,
+              "jquery.min.map": mapFile,
+              "jquery-latest.js": devFile,
+              "jquery-latest.min.js": minFile,
+              "jquery-latest.min.map": mapFile
+            };
+
+          if ( !fs.existsSync( cdnFolder ) ) {
+            fs.mkdirSync( cdnFolder );
+          }
+
+          Object.keys( releaseFiles ).forEach(function( key ) {
+            var text,
+              builtFile = releaseFiles[ key ],
+              unpathedFile = key.replace( /VER/g, version ),
+              releaseFile = cdnFolder + "/" + unpathedFile;
+
+            if ( /\.map$/.test( releaseFile ) ) {
+              // Map files need to reference the new uncompressed name;
+              // assume that all files reside in the same directory.
+              text = fs.readFileSync( builtFile, "utf8" )
+                .replace( /"file":"([^"]+)","sources":\["([^"]+)"\]/,
+                  "\"file\":\"" + unpathedFile.replace( /\.min\.map/, ".min.js" ) +
+                  "\",\"sources\":[\"" + unpathedFile.replace( /\.min\.map/, ".js" ) + "\"]" );
+              fs.writeFileSync( releaseFile, text );
+            } else if ( /\.min\.js$/.test( releaseFile ) ) {
+              // Remove the source map comment; it causes way too many problems.
+              text = fs.readFileSync( builtFile, "utf8" )
+                .replace( /\/\/# sourceMappingURL=\S+/, "" );
+              fs.writeFileSync( releaseFile, text );
+            } else {
+              fs.writeFileSync( releaseFile, fs.readFileSync( builtFile ) );
+            }
+          });
+          EOF
+          node /tmp/release-copies.js
+          ls -l dist/cdn
+
+      # The cdn copies are what CDN consumers load, so they must carry the fix too.
+      - name: Assert the dist/cdn copies carry the patched parseHTML
+        run: |
+          for f in dist/cdn/*.js dist/cdn/*.map; do
+            grep -q "createHTMLDocument" "$f" || { echo "UNPATCHED: $f"; exit 1; }
+          done
+          # "__proto__" is a string literal, so it reaches the .js copies but
+          # never the source maps (those only carry identifier names).
+          for f in dist/cdn/*.js; do
+            grep -q "__proto__" "$f" || { echo "UNPATCHED (extend): $f"; exit 1; }
+          done
+          echo "all dist/cdn copies carry the fix"
+
+      - name: Pack
+        run: npm pack
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: jquery-*.tgz
+          if-no-files-found: error
